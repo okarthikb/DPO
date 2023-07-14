@@ -92,6 +92,15 @@ def get_padded_batch(examples, max_len, device='cpu'):
 
 
 def get_log_ps(logits, idxs, loss_mask):
+  """
+  args:
+    logits: a tensor of shape (batch_size, seq_len, vocab_size)
+    idxs: a torch.long tensor of shape (batch_size, seq_len)
+    loss_mask: a torch.float tensor of shape (batch_size, seq_len)
+  
+  returns:
+    a tensor of shape (batch_size,), the log probabilities of each sequence in the batch
+  """
   idxs = idxs[:, 1:].unsqueeze(2)
   loss_mask = loss_mask[:, 1:]
   log_p_distributions = F.log_softmax(logits, dim=-1)[:, :-1]
@@ -106,6 +115,17 @@ def loss_fn(
   rejected_ref_log_ps,
   beta=0.01
 ):
+  """
+  args:
+    chosen_policy_log_ps: a tensor of shape (batch_size,)
+    rejected_policy_log_ps: a tensor of shape (batch_size,)
+    chosen_ref_log_ps: a tensor of shape (batch_size,)
+    rejected_ref_log_ps: a tensor of shape (batch_size,)
+    beta: the KL penalty parameter, default is 0.01 (from the paper)
+  
+  returns:
+    a scalar tensor, the loss
+  """
   policy_log_ratio = chosen_policy_log_ps - rejected_policy_log_ps
   ref_log_ratio = chosen_ref_log_ps - rejected_ref_log_ps
   loss = -F.logsigmoid(beta * (policy_log_ratio - ref_log_ratio)).mean()
@@ -113,6 +133,15 @@ def loss_fn(
 
 
 def compute_loss(policy_model, ref_model, batch):
+  """
+  args:
+    policy_model: the policy model, $\pi_{\theta}$
+    ref_model: the reference model, $\pi_{\phi}$
+    batch: a tuple of 4 tensors, each of shape (batch_size, max_len)
+
+  returns:
+    a scalar tensor, the loss
+  """
   chosen_tokens, rejected_tokens, chosen_loss_masks, rejected_loss_masks = batch
 
   chosen_policy_logits = policy_model(chosen_tokens).logits
@@ -181,16 +210,18 @@ def process(gpu, args):
   )
   ref_model.eval()
 
+  ctx_len = policy_model.config.max_position_embeddings
+
   dataset = torch.load('dataset.pt')
 
-  # if rank == 0:
-  #   initialize_logger(args.project, args.run)
+  if rank == 0:
+    initialize_logger(args.project, args.run)
 
   dist.barrier()
 
   for step in range(1, args.steps + 1):
     examples = random.sample(dataset, args.batch_size)
-    max_len = min(args.ctx_len, get_max_len(examples))
+    max_len = min(ctx_len, get_max_len(examples))
     batch = get_padded_batch(examples, max_len, device=device)
     loss = compute_loss(policy_model, ref_model, batch)
     loss.backward()
@@ -198,9 +229,11 @@ def process(gpu, args):
     optimizer.zero_grad()
     if rank == 0:
       log(loss.item(), step, args.log_interval)
+  
+  dist.barrier()
  
   if rank == 0:
-    pass  # torch.save(policy_model.state_dict(), 'policy_model.pt')
+    torch.save(policy_model.state_dict(), 'policy_model.pt')
 
   dist.destroy_process_group()
 
@@ -215,7 +248,6 @@ if __name__ == '__main__':
   parser.add_argument('--model', type=str, default='gpt2')
   parser.add_argument('--lr', type=float, default=1e-5)
   parser.add_argument('--batch_size', type=int, default=4)
-  parser.add_argument('--ctx_len', type=int, default=1024)
   parser.add_argument('--project', type=str, default='gpt2')
   parser.add_argument('--run', type=str, default='69')
   args = parser.parse_args()
