@@ -1,20 +1,24 @@
-import torch
-import os
-import wandb
-import random
+import os, random, wandb, torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.optim import Adam
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.cuda.amp import autocast, GradScaler
-from transformers import PretrainedConfig, GPT2LMHeadModel
-from typing import List, Tuple, Dict
+from torch.distributed.fsdp import (
+  FullyShardedDataParallel as FSDP,
+  MixedPrecision
+)
+from transformers import AutoModelForCausalLM
 from argparse import ArgumentParser
 
 
-def initialize_logger(project, run):
+KEY_PCT = 'prompt_chosen_tokens'
+KEY_PRT = 'prompt_rejected_tokens'
+KEY_CLM = 'chosen_loss_mask'
+KEY_RLM = 'rejected_loss_mask'
+
+
+def initialize_logger(project: str, run: str):
   wandb.init(project=project)
   wandb.run.name = run
 
@@ -26,34 +30,64 @@ def log(loss, step, interval):
 
 
 def pad_tensor(seq, max_len, pad_value):
+  """
+  args:
+    seq: a tensor of shape (seq_len,)
+    max_len: the length to pad to
+    pad_value: the value to pad with
+
+  returns:
+    a tensor of shape (max_len,)
+  """
+
   pad_len = max_len - seq.shape[0]
   if pad_len <= 0:
-    return seq
+    return seq[:max_len]
   return torch.cat([seq, torch.ones(pad_len, dtype=torch.long) * pad_value])
 
 
 def get_max_len(examples):
-  chosen, rejected = 'prompt_chosen_tokens', 'prompt_rejected_tokens'
+  """
+  args:
+    examples:
+      a list of examples, where each example is a dict with chosen and rejected
+      input tensors (along with loss masks)
+  
+  returns:
+    the length of the longest chosen or rejected input tensor
+  """
   return max(
-    max(len(example[chosen]), len(example[rejected])) for example in examples
+    max(len(example[KEY_PCT]), len(example[KEY_PRT])) for example in examples
   )
 
 
-def get_padded_batch(examples: List[Dict], max_len: int, device: str) -> Tuple[torch.Tensor]:
-  key_pct, key_prt = 'prompt_chosen_tokens', 'prompt_rejected_tokens'
-  key_clm, key_rlm = 'chosen_loss_mask', 'rejected_loss_mask'
+def get_padded_batch(examples, max_len, device='cpu'):
+  """
+  args:
+    examples: a list of examples, each a dict with 4 key-value pairs
+    max_len: the length each input tensor should be padded to
+    device: the device to put the tensors on, default is 'cpu'
+  
+  returns:
+    a tuple of 4 tensors, each of shape (batch_size, max_len)
+  """
+  
   chosen_tokens = torch.stack([
-    pad_tensor(example[key_pct], max_len, 1) for example in examples
+    pad_tensor(example[KEY_PCT], max_len, 1) for example in examples
   ]).to(device)
+
   rejected_tokens = torch.stack([
-    pad_tensor(example[key_prt], max_len, 1) for example in examples
+    pad_tensor(example[KEY_PRT], max_len, 1) for example in examples
   ]).to(device)
+
   chosen_loss_masks = torch.stack([
-    pad_tensor(example[key_clm], max_len, 0) for example in examples
+    pad_tensor(example[KEY_CLM], max_len, 0) for example in examples
   ]).to(device)
+
   rejected_loss_masks = torch.stack([
-    pad_tensor(example[key_rlm], max_len, 0) for example in examples
+    pad_tensor(example[KEY_RLM], max_len, 0) for example in examples
   ]).to(device)
+
   return chosen_tokens, rejected_tokens, chosen_loss_masks, rejected_loss_masks
 
 
@@ -81,33 +115,32 @@ def loss_fn(
 def compute_loss(policy_model, ref_model, batch):
   chosen_tokens, rejected_tokens, chosen_loss_masks, rejected_loss_masks = batch
 
-  with autocast():
-    chosen_policy_logits = policy_model(chosen_tokens).logits
-    rejected_policy_logits = policy_model(rejected_tokens).logits
-    chosen_policy_log_ps = get_log_ps(
-      chosen_policy_logits, chosen_tokens, chosen_loss_masks
+  chosen_policy_logits = policy_model(chosen_tokens).logits
+  rejected_policy_logits = policy_model(rejected_tokens).logits
+  chosen_policy_log_ps = get_log_ps(
+    chosen_policy_logits, chosen_tokens, chosen_loss_masks
+  )
+  rejected_policy_log_ps = get_log_ps(
+    rejected_policy_logits, rejected_tokens, rejected_loss_masks
+  )
+
+  with torch.no_grad():
+    chosen_ref_logits = ref_model(chosen_tokens).logits
+    rejected_ref_logits = ref_model(rejected_tokens).logits
+    chosen_ref_log_ps = get_log_ps(
+      chosen_ref_logits, chosen_tokens, chosen_loss_masks
     )
-    rejected_policy_log_ps = get_log_ps(
-      rejected_policy_logits, rejected_tokens, rejected_loss_masks
+    rejected_ref_log_ps = get_log_ps(
+      rejected_ref_logits, rejected_tokens, rejected_loss_masks
     )
 
-    with torch.no_grad():
-      chosen_ref_logits = ref_model(chosen_tokens).logits
-      rejected_ref_logits = ref_model(rejected_tokens).logits
-      chosen_ref_log_ps = get_log_ps(
-        chosen_ref_logits, chosen_tokens, chosen_loss_masks
-      )
-      rejected_ref_log_ps = get_log_ps(
-        rejected_ref_logits, rejected_tokens, rejected_loss_masks
-      )
-
-    return loss_fn(
-      chosen_policy_log_ps,
-      rejected_policy_log_ps,
-      chosen_ref_log_ps,
-      rejected_ref_log_ps,
-      beta=0.01
-    )
+  return loss_fn(
+    chosen_policy_log_ps,
+    rejected_policy_log_ps,
+    chosen_ref_log_ps,
+    rejected_ref_log_ps,
+    beta=0.01
+  )
 
 
 def process(gpu, args):
@@ -121,18 +154,31 @@ def process(gpu, args):
 
   device = torch.device(f'cuda:{rank}')
 
-  n_positions = PretrainedConfig.from_pretrained('gpt2').n_positions
+  # bfloat16 only works on Ampere GPUs
+  # refer https://pytorch.org/blog/efficient-large-scale-training-with-pytorch/
+  mixed_precision = MixedPrecision(
+    param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16
+  )
 
-  policy_model = GPT2LMHeadModel.from_pretrained('gpt2').to(device)
+  # load and shard policy model, $\pi_{\theta}$
+  policy_model = AutoModelForCausalLM.from_pretrained(args.model).to(device)
   policy_model = FSDP(
     policy_model,
     process_group=dist.new_group([i for i in range(world_size)]),
+    mixed_precision=mixed_precision, 
     device_id=rank
   )
   policy_model.train()
   optimizer = Adam(policy_model.parameters(), lr=args.lr)
 
-  ref_model = GPT2LMHeadModel.from_pretrained('gpt2').to(device)
+  # load and shard reference (pretrained) model, $\pi_{\phi}$
+  ref_model = AutoModelForCausalLM.from_pretrained(args.model).to(device)
+  ref_model = FSDP(
+    ref_model,
+    process_group=dist.new_group([i for i in range(world_size)]),
+    mixed_precision=mixed_precision, 
+    device_id=rank
+  )
   ref_model.eval()
 
   dataset = torch.load('dataset.pt')
@@ -140,21 +186,21 @@ def process(gpu, args):
   # if rank == 0:
   #   initialize_logger(args.project, args.run)
 
-  scaler = GradScaler()
+  dist.barrier()
+
   for step in range(1, args.steps + 1):
     examples = random.sample(dataset, args.batch_size)
-    max_len = min(n_positions, get_max_len(examples))
+    max_len = min(args.ctx_len, get_max_len(examples))
     batch = get_padded_batch(examples, max_len, device=device)
     loss = compute_loss(policy_model, ref_model, batch)
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
+    loss.backward()
+    optimizer.step() 
     optimizer.zero_grad()
     if rank == 0:
       log(loss.item(), step, args.log_interval)
  
-  # if rank == 0:
-    # torch.save(policy_model.state_dict(), 'policy_model.pt')
+  if rank == 0:
+    pass  # torch.save(policy_model.state_dict(), 'policy_model.pt')
 
   dist.destroy_process_group()
 
@@ -166,10 +212,12 @@ if __name__ == '__main__':
   parser.add_argument('--node', type=int, default=0)
   parser.add_argument('--steps', type=int, default=1000)
   parser.add_argument('--log_interval', type=int, default=1)
-  parser.add_argument('--project', type=str, default='gpt2-large_anthropic-hh-rlhf_DPO')
-  parser.add_argument('--run', type=str, default='1')
+  parser.add_argument('--model', type=str, default='gpt2')
   parser.add_argument('--lr', type=float, default=1e-5)
   parser.add_argument('--batch_size', type=int, default=4)
+  parser.add_argument('--ctx_len', type=int, default=1024)
+  parser.add_argument('--project', type=str, default='gpt2')
+  parser.add_argument('--run', type=str, default='69')
   args = parser.parse_args()
 
   os.environ['MASTER_ADDR'] = '127.0.0.1'
