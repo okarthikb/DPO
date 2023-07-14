@@ -63,6 +63,7 @@ def get_max_len(examples):
   returns:
     the length of the longest chosen or rejected input tensor
   """
+
   return max(
     max(len(example[KEY_PCT]), len(example[KEY_PRT])) for example in examples
   )
@@ -108,6 +109,7 @@ def get_log_ps(logits, idxs, loss_mask):
   returns:
     a tensor of shape (batch_size,), the log probabilities of each sequence in the batch
   """
+
   idxs = idxs[:, 1:].unsqueeze(2)
   loss_mask = loss_mask[:, 1:]
   log_p_distributions = F.log_softmax(logits, dim=-1)[:, :-1]
@@ -133,6 +135,7 @@ def loss_fn(
   returns:
     a scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
   """
+
   policy_log_ratio = chosen_policy_log_ps - rejected_policy_log_ps
   ref_log_ratio = chosen_ref_log_ps - rejected_ref_log_ps
   loss = -F.logsigmoid(beta * (policy_log_ratio - ref_log_ratio)).mean()
@@ -155,6 +158,7 @@ def compute_loss(policy_model, ref_model, batch, beta):
   returns:
     a scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
   """
+
   chosen_tokens, rejected_tokens, chosen_loss_masks, rejected_loss_masks = batch
 
   chosen_policy_logits = policy_model(chosen_tokens).logits
