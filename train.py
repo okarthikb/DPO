@@ -6,10 +6,12 @@ import torch.multiprocessing as mp
 from torch.optim import Adam
 from torch.distributed.fsdp import (
   FullyShardedDataParallel as FSDP,
+  # CPUOffload,
   MixedPrecision
 )
 from transformers import AutoModelForCausalLM
 from argparse import ArgumentParser
+import io #
 
 
 KEY_PCT = 'prompt_chosen_tokens'
@@ -23,10 +25,15 @@ def initialize_logger(project: str, run: str):
   wandb.run.name = run
 
 
-def log(loss, step, interval):
+def log(loss, chosen_reward, rejected_reward, step, interval):
   if step % interval == 0:
-    # wandb.log({'loss': loss}, step=step)
-    print(f'step = {step}\tloss = {loss}')
+    wandb.log(
+      {'loss': loss, 'chosen_reward': chosen_reward, 'rejected_reward': rejected_reward},
+      step=step
+    )
+    print(
+      f'step = {step}\tloss = {loss}\tchosen_reward = {chosen_reward}\trejected_reward = {rejected_reward}'
+    )
 
 
 def pad_tensor(seq, max_len, pad_value):
@@ -124,15 +131,21 @@ def loss_fn(
     beta: the KL penalty parameter, default is 0.01 (from the paper)
   
   returns:
-    a scalar tensor, the loss
+    a scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
   """
   policy_log_ratio = chosen_policy_log_ps - rejected_policy_log_ps
   ref_log_ratio = chosen_ref_log_ps - rejected_ref_log_ps
   loss = -F.logsigmoid(beta * (policy_log_ratio - ref_log_ratio)).mean()
-  return loss
+  
+  # compute rewards too
+  with torch.no_grad():
+    chosen_reward = beta * (chosen_policy_log_ps - chosen_ref_log_ps).sum()
+    rejected_reward = beta * (rejected_policy_log_ps - rejected_ref_log_ps).sum()
+
+  return loss, chosen_reward, rejected_reward
 
 
-def compute_loss(policy_model, ref_model, batch):
+def compute_loss(policy_model, ref_model, batch, beta):
   """
   args:
     policy_model: the policy model, $\pi_{\theta}$
@@ -140,7 +153,7 @@ def compute_loss(policy_model, ref_model, batch):
     batch: a tuple of 4 tensors, each of shape (batch_size, max_len)
 
   returns:
-    a scalar tensor, the loss
+    a scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
   """
   chosen_tokens, rejected_tokens, chosen_loss_masks, rejected_loss_masks = batch
 
@@ -168,7 +181,7 @@ def compute_loss(policy_model, ref_model, batch):
     rejected_policy_log_ps,
     chosen_ref_log_ps,
     rejected_ref_log_ps,
-    beta=0.01
+    beta=beta
   )
 
 
@@ -194,7 +207,8 @@ def process(gpu, args):
   policy_model = FSDP(
     policy_model,
     process_group=dist.new_group([i for i in range(world_size)]),
-    mixed_precision=mixed_precision, 
+    mixed_precision=mixed_precision,
+    # cpu_offload=CPUOffload(offload_params=True),
     device_id=rank
   )
   policy_model.train()
@@ -205,7 +219,8 @@ def process(gpu, args):
   ref_model = FSDP(
     ref_model,
     process_group=dist.new_group([i for i in range(world_size)]),
-    mixed_precision=mixed_precision, 
+    mixed_precision=mixed_precision,
+    # cpu_offload=CPUOffload(offload_params=True),
     device_id=rank
   )
   ref_model.eval()
@@ -215,7 +230,7 @@ def process(gpu, args):
   dataset = torch.load('dataset.pt')
 
   if rank == 0:
-    initialize_logger(args.project, args.run)
+    initialize_logger(args.project, args.run_name)
 
   dist.barrier()
 
@@ -223,17 +238,29 @@ def process(gpu, args):
     examples = random.sample(dataset, args.batch_size)
     max_len = min(ctx_len, get_max_len(examples))
     batch = get_padded_batch(examples, max_len, device=device)
-    loss = compute_loss(policy_model, ref_model, batch)
+    loss, chosen_reward, rejected_reward = compute_loss(
+      policy_model, ref_model, batch, args.beta
+    )
     loss.backward()
     optimizer.step() 
     optimizer.zero_grad()
     if rank == 0:
-      log(loss.item(), step, args.log_interval)
+      log(
+        loss.item(),
+        chosen_reward.item(),
+        rejected_reward.item(),
+        step, 
+        args.log_interval
+      )
   
   dist.barrier()
  
   if rank == 0:
-    torch.save(policy_model.state_dict(), 'policy_model.pt')
+    buffer = io.BytesIO()
+    torch.save(policy_model.state_dict(), buffer)
+
+    with open('model.pt', 'wb') as f:
+      f.write(buffer.getbuffer())
 
   dist.destroy_process_group()
 
@@ -247,9 +274,10 @@ if __name__ == '__main__':
   parser.add_argument('--log_interval', type=int, default=1)
   parser.add_argument('--model', type=str, default='gpt2')
   parser.add_argument('--lr', type=float, default=1e-5)
+  parser.add_argument('--beta', type=float, default=0.01)
   parser.add_argument('--batch_size', type=int, default=4)
   parser.add_argument('--project', type=str, default='gpt2')
-  parser.add_argument('--run', type=str, default='69')
+  parser.add_argument('--run_name', type=str, default='69')
   args = parser.parse_args()
 
   os.environ['MASTER_ADDR'] = '127.0.0.1'
