@@ -9,6 +9,8 @@ Check out my [post](http://okarthikb.github.io/site/blog/dpo.html) for a more in
 To train, get the `jsonl` files. Then
 
 ```
-python3 dataset.py --model <Hugging Face model path> --dataset <path to jsonl file>
-python3 train.py --nodes <number of nodes> --gpus <gpus per node> --model <Hugging Face model path> ...
+python3 dataset.py --model <path to HF model> --dataset <path to jsonl file>
+python3 train.py --nodes <number of nodes> --gpus <gpus per node> --model <path to HF model> ...
 ```
+
+For `<path to HF model>`, use Eleuther's Pythia or the GPT-2 models.
