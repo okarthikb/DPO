@@ -1,4 +1,4 @@
-import os, random, torch, io  # , wandb
+import os, random, torch, wandb
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -22,31 +22,32 @@ KEY_CLM = 'chosen_loss_mask'
 KEY_RLM = 'rejected_loss_mask'
 
 
-# def initialize_logger(project: str, run: str):
-  # wandb.init(project=project)
-  # wandb.run.name = run
+def initialize_logger(project, run):
+  wandb.init(project=project)
+  wandb.run.name = run
 
 
-def log(loss, chosen_reward, rejected_reward, step, interval):
+def log(loss, chosen_reward, rejected_reward, step, interval, flag):
   if step % interval == 0:
-    # wandb.log(
-    #   {'loss': loss, 'chosen_reward': chosen_reward, 'rejected_reward': rejected_reward},
-    #   step=step
-    # )
     print(
       f'step = {step}\tloss = {loss}\tchosen_reward = {chosen_reward}\trejected_reward = {rejected_reward}'
     )
+    if flag:
+      wandb.log(
+        {'loss': loss, 'chosen_reward': chosen_reward, 'rejected_reward': rejected_reward},
+        step=step
+      )
 
 
 def pad_tensor(seq, max_len, pad_value):
   """
   args:
-    seq: a tensor of shape (seq_len,)
-    max_len: the length to pad to
-    pad_value: the value to pad with
+    seq: A tensor of shape (seq_len,)
+    max_len: The length to pad to
+    pad_value: The value to pad with
 
   returns:
-    a tensor of shape (max_len,)
+    A tensor of shape (max_len,)
   """
 
   pad_len = max_len - seq.shape[0]
@@ -59,11 +60,11 @@ def get_max_len(examples):
   """
   args:
     examples:
-      a list of examples, where each example is a dict with chosen and rejected
+      A list of examples, where each example is a dict with chosen and rejected
       input tensors (along with loss masks)
   
   returns:
-    the length of the longest chosen or rejected input tensor
+    The length of the longest chosen or rejected input tensor
   """
 
   return max(
@@ -74,12 +75,12 @@ def get_max_len(examples):
 def get_padded_batch(examples, max_len, device='cpu'):
   """
   args:
-    examples: a list of examples, each a dict with 4 key-value pairs
-    max_len: the length each input tensor should be padded to
-    device: the device to put the tensors on, default is 'cpu'
+    examples: A list of examples, each a dict with 4 key-value pairs
+    max_len: The length each input tensor should be padded to
+    device: The device to put the tensors on, default is 'cpu'
   
   returns:
-    a tuple of 4 tensors, each of shape (batch_size, max_len)
+    A tuple of 4 tensors, each of shape (batch_size, max_len)
   """
   
   chosen_tokens = torch.stack([
@@ -104,12 +105,12 @@ def get_padded_batch(examples, max_len, device='cpu'):
 def get_log_ps(logits, idxs, loss_mask):
   """
   args:
-    logits: a tensor of shape (batch_size, seq_len, vocab_size)
-    idxs: a torch.long tensor of shape (batch_size, seq_len)
-    loss_mask: a torch.float tensor of shape (batch_size, seq_len)
+    logits: A tensor of shape (batch_size, seq_len, vocab_size)
+    idxs: A torch.long tensor of shape (batch_size, seq_len)
+    loss_mask: A torch.float tensor of shape (batch_size, seq_len)
   
   returns:
-    a tensor of shape (batch_size,), the log probabilities of each sequence in the batch
+    A tensor of shape (batch_size,), the log probabilities of each sequence in the batch
   """
 
   idxs = idxs[:, 1:].unsqueeze(2)
@@ -128,14 +129,14 @@ def loss_fn(
 ):
   """
   args:
-    chosen_policy_log_ps: a tensor of shape (batch_size,)
-    rejected_policy_log_ps: a tensor of shape (batch_size,)
-    chosen_ref_log_ps: a tensor of shape (batch_size,)
-    rejected_ref_log_ps: a tensor of shape (batch_size,)
-    beta: the KL penalty parameter, default is 0.01 (from the paper)
+    chosen_policy_log_ps: A tensor of shape (batch_size,)
+    rejected_policy_log_ps: A tensor of shape (batch_size,)
+    chosen_ref_log_ps: A tensor of shape (batch_size,)
+    rejected_ref_log_ps: A tensor of shape (batch_size,)
+    beta: The KL penalty parameter, default is 0.01 (from the paper)
   
   returns:
-    a scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
+    A scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
   """
 
   policy_log_ratio = chosen_policy_log_ps - rejected_policy_log_ps
@@ -153,21 +154,22 @@ def loss_fn(
 def compute_loss(policy_model, ref_model, batch, beta):
   """
   args:
-    policy_model: the policy model, $\pi_{\theta}$
-    ref_model: the reference model, $\pi_{\phi}$
-    batch: a tuple of 4 tensors, each of shape (batch_size, max_len)
+    policy_model: The policy model, $\pi_{\theta}$
+    ref_model: The reference model, $\pi_{\phi}$
+    batch: A tuple of 4 tensors, each of shape (batch_size, max_len)
 
   returns:
-    a scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
+    A scalar tensor, the loss, and two scalar tensors, the chosen and rejected rewards
   """
 
   chosen_tokens, rejected_tokens, chosen_loss_masks, rejected_loss_masks = batch
 
   chosen_policy_logits = policy_model(chosen_tokens).logits
-  rejected_policy_logits = policy_model(rejected_tokens).logits
   chosen_policy_log_ps = get_log_ps(
     chosen_policy_logits, chosen_tokens, chosen_loss_masks
   )
+  
+  rejected_policy_logits = policy_model(rejected_tokens).logits
   rejected_policy_log_ps = get_log_ps(
     rejected_policy_logits, rejected_tokens, rejected_loss_masks
   )
@@ -202,8 +204,6 @@ def process(gpu, args):
 
   device = torch.device(f'cuda:{rank}')
 
-  # bfloat16 only works on Ampere GPUs
-  # refer https://pytorch.org/blog/efficient-large-scale-training-with-pytorch/
   mixed_precision = MixedPrecision(
     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16
   )
@@ -230,15 +230,18 @@ def process(gpu, args):
         CheckpointImpl,
         apply_activation_checkpointing_wrapper,
       )
-      # Pythia uses GPTNeoXLayer layers, import for checkpoint wrapper
+      
+      from transformers.models.gpt2.modeling_gpt2 import GPT2Block
       from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+
+      Layer = GPT2Block if 'gpt2' in args.model else GPTNeoXLayer
       
       non_reentrant_wrapper = partial(
         checkpoint_wrapper,
         offload_to_cpu=False,
         checkpoint_impl=CheckpointImpl.NO_REENTRANT,
       )
-      check_fn = lambda submodule: isinstance(submodule, GPTNeoXLayer)
+      check_fn = lambda submodule: isinstance(submodule, Layer)
       apply_activation_checkpointing_wrapper(
         policy_model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
       )
@@ -262,8 +265,9 @@ def process(gpu, args):
   optimizer = Adam(policy_model.parameters(), lr=args.lr)
   dataset = torch.load('dataset.pt')
 
-  # if rank == 0:
-  #   initialize_logger(args.project, args.run_name)
+  if rank == 0 and args.wandb:
+    assert [args.project, args.run_name] != [None, None], 'Project and run name must be specified'
+    initialize_logger(args.project, args.run_name)
 
   # sync processes
   dist.barrier()
@@ -287,7 +291,8 @@ def process(gpu, args):
         chosen_reward.item(),
         rejected_reward.item(),
         step, 
-        args.log_interval
+        args.log_interval,
+        args.wandb
       )
   
   dist.barrier()
@@ -309,13 +314,27 @@ if __name__ == '__main__':
   parser.add_argument('--lr', type=float, default=1e-6)
   parser.add_argument('--beta', type=float, default=0.1)
   parser.add_argument('--batch_size', type=int, default=4)
-  parser.add_argument('--project', type=str, default='Pythia-DPO-test')
-  parser.add_argument('--run_name', type=str, default='69')
   parser.add_argument('--cpu_offload', type=bool, default=False)
   parser.add_argument('--activation_checkpointing', type=bool, default=True)
+  parser.add_argument('--wandb', type=bool, default=False)
+  parser.add_argument('--project', type=str, default=None)
+  parser.add_argument('--run_name', type=str, default=None)
   args = parser.parse_args()
 
   os.environ['MASTER_ADDR'] = '127.0.0.1'
   os.environ['MASTER_PORT'] = '6969'
+
+  assert args.model in [
+    'EleutherAI/Pythia-70M',
+    'EleutherAI/Pythia-160M',
+    'EleutherAI/Pythia-410M',
+    'EleutherAI/Pythia-1B',
+    'EleutherAI/Pythia-1.4B',
+    'EleutherAI/Pythia-2.8B',
+    'gpt2',
+    'gpt2-medium',
+    'gpt2-large',
+    'gpt2-xl'
+  ], 'Invalid model name'
 
   mp.spawn(process, args=(args,), nprocs=args.nodes * args.gpus, join=True)
