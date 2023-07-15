@@ -1,17 +1,19 @@
-import os, random, wandb, torch
+import os, random, torch, io  # , wandb
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.optim import Adam
+
 from torch.distributed.fsdp import (
   FullyShardedDataParallel as FSDP,
-  # CPUOffload,
+  CPUOffload,
   MixedPrecision
 )
+
 from transformers import AutoModelForCausalLM
 from argparse import ArgumentParser
-import io #
+from functools import partial
 
 
 KEY_PCT = 'prompt_chosen_tokens'
@@ -20,17 +22,17 @@ KEY_CLM = 'chosen_loss_mask'
 KEY_RLM = 'rejected_loss_mask'
 
 
-def initialize_logger(project: str, run: str):
-  wandb.init(project=project)
-  wandb.run.name = run
+# def initialize_logger(project: str, run: str):
+  # wandb.init(project=project)
+  # wandb.run.name = run
 
 
 def log(loss, chosen_reward, rejected_reward, step, interval):
   if step % interval == 0:
-    wandb.log(
-      {'loss': loss, 'chosen_reward': chosen_reward, 'rejected_reward': rejected_reward},
-      step=step
-    )
+    # wandb.log(
+    #   {'loss': loss, 'chosen_reward': chosen_reward, 'rejected_reward': rejected_reward},
+    #   step=step
+    # )
     print(
       f'step = {step}\tloss = {loss}\tchosen_reward = {chosen_reward}\trejected_reward = {rejected_reward}'
     )
@@ -212,11 +214,38 @@ def process(gpu, args):
     policy_model,
     process_group=dist.new_group([i for i in range(world_size)]),
     mixed_precision=mixed_precision,
-    # cpu_offload=CPUOffload(offload_params=True),
+    cpu_offload=CPUOffload(offload_params=args.cpu_offload),
     device_id=rank
   )
+  # train mode
   policy_model.train()
-  optimizer = Adam(policy_model.parameters(), lr=args.lr)
+
+  # apply activation checkpointing to policy model
+  if args.activation_checkpointing:
+
+    # check if activation checkpointing is available
+    try:
+      from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+        CheckpointImpl,
+        apply_activation_checkpointing_wrapper,
+      )
+      # Pythia uses GPTNeoXLayer layers, import for checkpoint wrapper
+      from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+      
+      non_reentrant_wrapper = partial(
+        checkpoint_wrapper,
+        offload_to_cpu=False,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+      )
+      check_fn = lambda submodule: isinstance(submodule, GPTNeoXLayer)
+      apply_activation_checkpointing_wrapper(
+        policy_model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+      )
+    
+    except ImportError:
+      if rank == 0:
+        print('Activation checkpointing not available :(')
 
   # load and shard reference (pretrained) model, $\pi_{\phi}$
   ref_model = AutoModelForCausalLM.from_pretrained(args.model).to(device)
@@ -224,19 +253,23 @@ def process(gpu, args):
     ref_model,
     process_group=dist.new_group([i for i in range(world_size)]),
     mixed_precision=mixed_precision,
-    # cpu_offload=CPUOffload(offload_params=True),
+    cpu_offload=CPUOffload(offload_params=args.cpu_offload),
     device_id=rank
   )
+  # eval model, we won't be training it
   ref_model.eval()
-
-  ctx_len = policy_model.config.max_position_embeddings
-
+  
+  optimizer = Adam(policy_model.parameters(), lr=args.lr)
   dataset = torch.load('dataset.pt')
 
-  if rank == 0:
-    initialize_logger(args.project, args.run_name)
+  # if rank == 0:
+  #   initialize_logger(args.project, args.run_name)
 
+  # sync processes
   dist.barrier()
+
+  # get model context length
+  ctx_len = policy_model.config.max_position_embeddings
 
   for step in range(1, args.steps + 1):
     examples = random.sample(dataset, args.batch_size)
@@ -260,11 +293,7 @@ def process(gpu, args):
   dist.barrier()
  
   if rank == 0:
-    buffer = io.BytesIO()
-    torch.save(policy_model.state_dict(), buffer)
-
-    with open('model.pt', 'wb') as f:
-      f.write(buffer.getbuffer())
+    policy_model.save_pretrained('policy_model.pth')
 
   dist.destroy_process_group()
 
@@ -274,14 +303,16 @@ if __name__ == '__main__':
   parser.add_argument('--nodes', type=int, default=1)
   parser.add_argument('--gpus', type=int, default=4)
   parser.add_argument('--node', type=int, default=0)
-  parser.add_argument('--steps', type=int, default=1000)
+  parser.add_argument('--steps', type=int, default=10)
   parser.add_argument('--log_interval', type=int, default=1)
-  parser.add_argument('--model', type=str, default='gpt2')
-  parser.add_argument('--lr', type=float, default=1e-5)
-  parser.add_argument('--beta', type=float, default=0.01)
+  parser.add_argument('--model', type=str, default='EleutherAI/Pythia-1B')
+  parser.add_argument('--lr', type=float, default=1e-6)
+  parser.add_argument('--beta', type=float, default=0.1)
   parser.add_argument('--batch_size', type=int, default=4)
-  parser.add_argument('--project', type=str, default='gpt2')
+  parser.add_argument('--project', type=str, default='Pythia-DPO-test')
   parser.add_argument('--run_name', type=str, default='69')
+  parser.add_argument('--cpu_offload', type=bool, default=False)
+  parser.add_argument('--activation_checkpointing', type=bool, default=True)
   args = parser.parse_args()
 
   os.environ['MASTER_ADDR'] = '127.0.0.1'
