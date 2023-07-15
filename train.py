@@ -306,11 +306,11 @@ def process(gpu, args):
 if __name__ == '__main__':
   parser = ArgumentParser()
   parser.add_argument('--nodes', type=int, default=1)
-  parser.add_argument('--gpus', type=int, default=4)
+  parser.add_argument('--gpus', type=int, default=2)
   parser.add_argument('--node', type=int, default=0)
   parser.add_argument('--steps', type=int, default=10)
   parser.add_argument('--log_interval', type=int, default=1)
-  parser.add_argument('--model', type=str, default='EleutherAI/Pythia-1B')
+  parser.add_argument('--model', type=str, default='gpt2')
   parser.add_argument('--lr', type=float, default=1e-6)
   parser.add_argument('--beta', type=float, default=0.1)
   parser.add_argument('--batch_size', type=int, default=4)
