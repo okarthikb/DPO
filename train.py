@@ -11,6 +11,11 @@ from torch.distributed.fsdp import (
   MixedPrecision
 )
 
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+
+from transformers.models.gpt2.modeling_gpt2 import GPT2Block
+from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
+
 from transformers import AutoModelForCausalLM
 from argparse import ArgumentParser
 from functools import partial
@@ -145,8 +150,8 @@ def loss_fn(
   
   # compute rewards too
   with torch.no_grad():
-    chosen_reward = beta * (chosen_policy_log_ps - chosen_ref_log_ps).sum()
-    rejected_reward = beta * (rejected_policy_log_ps - rejected_ref_log_ps).sum()
+    chosen_reward = beta * (chosen_policy_log_ps - chosen_ref_log_ps).sum().cpu()
+    rejected_reward = beta * (rejected_policy_log_ps - rejected_ref_log_ps).sum().cpu()
 
   return loss, chosen_reward, rejected_reward
 
@@ -168,7 +173,7 @@ def compute_loss(policy_model, ref_model, batch, beta):
   chosen_policy_log_ps = get_log_ps(
     chosen_policy_logits, chosen_tokens, chosen_loss_masks
   )
-  
+
   rejected_policy_logits = policy_model(rejected_tokens).logits
   rejected_policy_log_ps = get_log_ps(
     rejected_policy_logits, rejected_tokens, rejected_loss_masks
@@ -204,6 +209,13 @@ def process(gpu, args):
 
   device = torch.device(f'cuda:{rank}')
 
+  Layer = GPT2Block if 'gpt2' in args.model else GPTNeoXLayer
+
+  auto_wrap_policy = partial(
+    transformer_auto_wrap_policy,
+    transformer_layer_cls={Layer}
+  )
+
   mixed_precision = MixedPrecision(
     param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16
   )
@@ -213,12 +225,16 @@ def process(gpu, args):
   policy_model = FSDP(
     policy_model,
     process_group=dist.new_group([i for i in range(world_size)]),
+    auto_wrap_policy=auto_wrap_policy,
     mixed_precision=mixed_precision,
     cpu_offload=CPUOffload(offload_params=args.cpu_offload),
-    device_id=rank
+    device_id=torch.cuda.current_device()
   )
   # train mode
   policy_model.train()
+  
+  if rank == 0:
+    print('Loaded and sharded policy model')
 
   # apply activation checkpointing to policy model
   if args.activation_checkpointing:
@@ -228,13 +244,8 @@ def process(gpu, args):
       from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
         checkpoint_wrapper,
         CheckpointImpl,
-        apply_activation_checkpointing_wrapper,
+        apply_activation_checkpointing,
       )
-      
-      from transformers.models.gpt2.modeling_gpt2 import GPT2Block
-      from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXLayer
-
-      Layer = GPT2Block if 'gpt2' in args.model else GPTNeoXLayer
       
       non_reentrant_wrapper = partial(
         checkpoint_wrapper,
@@ -242,9 +253,12 @@ def process(gpu, args):
         checkpoint_impl=CheckpointImpl.NO_REENTRANT,
       )
       check_fn = lambda submodule: isinstance(submodule, Layer)
-      apply_activation_checkpointing_wrapper(
+      apply_activation_checkpointing(
         policy_model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
       )
+      
+      if rank == 0:
+        print('Applied activation checkpointing')
     
     except ImportError:
       if rank == 0:
@@ -257,10 +271,11 @@ def process(gpu, args):
     process_group=dist.new_group([i for i in range(world_size)]),
     mixed_precision=mixed_precision,
     cpu_offload=CPUOffload(offload_params=args.cpu_offload),
-    device_id=rank
+    device_id=torch.cuda.current_device()
   )
   # eval model, we won't be training it
   ref_model.eval()
+  print('Loaded and sharded reference model')
   
   optimizer = Adam(policy_model.parameters(), lr=args.lr)
   dataset = torch.load('dataset.pt')
@@ -306,11 +321,11 @@ def process(gpu, args):
 if __name__ == '__main__':
   parser = ArgumentParser()
   parser.add_argument('--nodes', type=int, default=1)
-  parser.add_argument('--gpus', type=int, default=2)
+  parser.add_argument('--gpus', type=int, default=4)
   parser.add_argument('--node', type=int, default=0)
   parser.add_argument('--steps', type=int, default=10)
   parser.add_argument('--log_interval', type=int, default=1)
-  parser.add_argument('--model', type=str, default='gpt2')
+  parser.add_argument('--model', type=str, default='EleutherAI/Pythia-2.8B')
   parser.add_argument('--lr', type=float, default=1e-6)
   parser.add_argument('--beta', type=float, default=0.1)
   parser.add_argument('--batch_size', type=int, default=4)
@@ -320,9 +335,6 @@ if __name__ == '__main__':
   parser.add_argument('--project', type=str, default=None)
   parser.add_argument('--run_name', type=str, default=None)
   args = parser.parse_args()
-
-  os.environ['MASTER_ADDR'] = '127.0.0.1'
-  os.environ['MASTER_PORT'] = '6969'
 
   assert args.model in [
     'EleutherAI/Pythia-70M',
@@ -336,5 +348,8 @@ if __name__ == '__main__':
     'gpt2-large',
     'gpt2-xl'
   ], 'Invalid model name'
+
+  os.environ['MASTER_ADDR'] = '127.0.0.1'
+  os.environ['MASTER_PORT'] = '4269'
 
   mp.spawn(process, args=(args,), nprocs=args.nodes * args.gpus, join=True)
