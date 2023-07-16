@@ -273,7 +273,7 @@ def process(gpu, args):
     cpu_offload=CPUOffload(offload_params=args.cpu_offload),
     device_id=torch.cuda.current_device()
   )
-  # eval model, we won't be training it
+  # eval mode, we won't be training it
   ref_model.eval()
   print('Loaded and sharded reference model')
   
