@@ -160,7 +160,7 @@ def compute_loss(policy_model, ref_model, batch, beta):
   """
   args:
     policy_model: The policy model, $\pi_{\theta}$
-    ref_model: The reference model, $\pi_{\phi}$
+    ref_model: The reference model, $\pi_{\text{ref}}$
     batch: A tuple of 4 tensors, each of shape (batch_size, max_len)
 
   returns:
@@ -264,7 +264,7 @@ def process(gpu, args):
       if rank == 0:
         print('Activation checkpointing not available :(')
 
-  # load and shard reference (pretrained) model, $\pi_{\phi}$
+  # load and shard reference (pretrained) model, $\pi_{\text{ref}}$
   ref_model = AutoModelForCausalLM.from_pretrained(args.model).to(device)
   ref_model = FSDP(
     ref_model,
