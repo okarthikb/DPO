@@ -30,5 +30,6 @@ For `<path to HF model>`, use Eleuther's Pythia or the GPT-2 models. Training is
 1. [Training Deep Nets with Sublinear Memory Cost](https://arxiv.org/abs/1604.06174)
 2. [Gradient-Checkpointing in PyTorch](https://qywu.github.io/2019/05/22/explore-gradient-checkpointing.html)
 3. [PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel](https://arxiv.org/abs/2304.11277)
-4. [DPO](https://arxiv.org/abs/2305.18290)
-5. [RLHF](https://arxiv.org/abs/1706.03741)
+4. [Tensor Parallelism in NumPy](https://www.mishalaskin.com/posts/tensor_parallel) (not really relevant to this project, but useful reading)
+5. [DPO](https://arxiv.org/abs/2305.18290)
+6. [RLHF](https://arxiv.org/abs/1706.03741)
